@@ -33,6 +33,11 @@ export interface ProposerWhitelistMutationResponse {
   txHashes: Hash[]
 }
 
+export interface ProposerWhitelistDeploymentResponse {
+  whitelistAddress: Address
+  txHashes: Hash[]
+}
+
 const GAS_FEE_TOO_LOW_PATTERNS = [
   'gas price below minimum',
   'transaction underpriced',
@@ -53,6 +58,18 @@ export function shortenProposerWhitelistAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`
 }
 
+export function resolveProposerWhitelistAddress(...candidates: Array<string | null | undefined>): Address | null {
+  for (const candidate of candidates) {
+    if (!candidate || !isAddress(candidate)) {
+      continue
+    }
+
+    return getAddress(candidate) as Address
+  }
+
+  return null
+}
+
 export function normalizeProposerAddressList(value: string | string[]) {
   const values = Array.isArray(value)
     ? value
@@ -71,6 +88,11 @@ export function normalizeProposerAddressList(value: string | string[]) {
     deduped.set(normalized.toLowerCase(), normalized)
   }
   return [...deduped.values()]
+}
+
+export function omitCreatorFromProposerAddressList(creator: Address, proposers: Address[]) {
+  const creatorKey = creator.toLowerCase()
+  return proposers.filter(proposer => proposer.toLowerCase() !== creatorKey)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -138,6 +160,14 @@ export function readProposerWhitelistError(error: unknown) {
 
   if (lower.includes('user rejected') || lower.includes('user denied') || lower.includes('rejected the request')) {
     return 'Wallet signature was rejected.'
+  }
+
+  if (
+    lower.includes('invalid string length')
+    || lower.includes('request was aborted')
+    || lower.includes('unknown rpc error')
+  ) {
+    return 'Could not update proposer whitelist.'
   }
 
   if (lower.includes('notcreator') || lower.includes('not creator')) {

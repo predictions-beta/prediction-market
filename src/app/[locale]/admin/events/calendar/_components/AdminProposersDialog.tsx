@@ -1,14 +1,14 @@
 'use client'
 
-import type { Address, Hash } from 'viem'
+import type { Address, Hash, Hex } from 'viem'
 import type { SignerOption } from './admin-create-event-form-types'
-import type { ProposerWhitelistCreatorOption, ProposerWhitelistMutationResponse, ProposerWhitelistStatus, ProposerWhitelistStatusResponse } from '@/lib/proposer-whitelist'
-import { useAppKitAccount } from '@reown/appkit/react'
+import type { ProposerWhitelistCreatorOption, ProposerWhitelistDeploymentResponse, ProposerWhitelistMutationResponse, ProposerWhitelistStatus, ProposerWhitelistStatusResponse } from '@/lib/proposer-whitelist'
+import { useAppKitAccount, useAppKitNetworkCore, useAppKitProvider } from '@reown/appkit/react'
 import { CheckCircle2Icon, CircleIcon, Loader2Icon, PlusIcon, UserCheckIcon, XIcon } from 'lucide-react'
 import { useExtracted } from 'next-intl'
 import { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { getAddress, isAddress } from 'viem'
+import { encodeDeployData, encodeFunctionData, getAddress, isAddress, toHex } from 'viem'
 import { usePublicClient, useWalletClient } from 'wagmi'
 import { Button } from '@/components/ui/button'
 import {
@@ -32,8 +32,9 @@ import { DEFAULT_CHAIN_ID } from '@/lib/network'
 import {
   isProposerWhitelistStatusResponse,
   normalizeProposerAddressList,
-
+  omitCreatorFromProposerAddressList,
   readProposerWhitelistError,
+  resolveProposerWhitelistAddress,
   shortenProposerWhitelistAddress,
 } from '@/lib/proposer-whitelist'
 import {
@@ -41,8 +42,11 @@ import {
   CREATOR_PROPOSER_WHITELIST_BYTECODE,
   CREATOR_PROPOSER_WHITELIST_REGISTRY_ABI,
 } from '@/lib/proposer-whitelist-contracts'
+import { sendWithEstimatedFeeRetry } from '@/lib/transaction-fees'
 import { cn } from '@/lib/utils'
 import { defaultViemNetwork } from '@/lib/viem-network'
+import { useUser } from '@/stores/useUser'
+import { isBigIntSerializationError } from './admin-create-event-form-utils'
 
 interface AdminProposersDialogProps {
   open: boolean
@@ -54,6 +58,31 @@ interface AdminProposersDialogProps {
 
 interface EventCreationSignersResponse {
   data?: SignerOption[]
+}
+
+interface RpcWalletProvider {
+  request: (args: { method: string, params?: unknown[] }) => Promise<unknown>
+}
+
+function isRpcWalletProvider(value: unknown): value is RpcWalletProvider {
+  return Boolean(value)
+    && typeof value === 'object'
+    && typeof (value as { request?: unknown }).request === 'function'
+}
+
+function resolveChainId(value: number | string | undefined) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function isSameAddress(first?: string | null, second?: string | null) {
+  return Boolean(first && second && first.toLowerCase() === second.toLowerCase())
 }
 
 function readApiError(payload: unknown) {
@@ -145,6 +174,16 @@ function isMutationResponse(payload: unknown): payload is ProposerWhitelistMutat
   return Boolean(candidate.status) && Array.isArray(candidate.txHashes)
 }
 
+function isDeploymentResponse(payload: unknown): payload is ProposerWhitelistDeploymentResponse {
+  if (!payload || typeof payload !== 'object') {
+    return false
+  }
+  const candidate = payload as Partial<ProposerWhitelistDeploymentResponse>
+  return typeof candidate.whitelistAddress === 'string'
+    && isAddress(candidate.whitelistAddress)
+    && Array.isArray(candidate.txHashes)
+}
+
 function getPreferredCreator(input: {
   initialCreatorAddress?: string | null
   selectedCreator: Address | null
@@ -163,6 +202,42 @@ function getPreferredCreator(input: {
   return input.creators[0]?.address ?? null
 }
 
+function buildRpcWalletTransactionRequest(params: {
+  from: `0x${string}`
+  data: `0x${string}`
+  to?: `0x${string}`
+  value?: bigint
+  maxFeePerGas?: bigint
+  maxPriorityFeePerGas?: bigint
+}) {
+  const request: {
+    from: `0x${string}`
+    data: `0x${string}`
+    to?: `0x${string}`
+    value: Hex
+    maxFeePerGas?: Hex
+    maxPriorityFeePerGas?: Hex
+  } = {
+    from: params.from,
+    data: params.data,
+    value: toHex(params.value ?? 0n),
+  }
+
+  if (params.to) {
+    request.to = params.to
+  }
+
+  if (typeof params.maxFeePerGas === 'bigint') {
+    request.maxFeePerGas = toHex(params.maxFeePerGas)
+  }
+
+  if (typeof params.maxPriorityFeePerGas === 'bigint') {
+    request.maxPriorityFeePerGas = toHex(params.maxPriorityFeePerGas)
+  }
+
+  return request
+}
+
 export default function AdminProposersDialog({
   open,
   onOpenChange,
@@ -171,14 +246,25 @@ export default function AdminProposersDialog({
   onStatusChange,
 }: AdminProposersDialogProps) {
   const t = useExtracted()
-  const { address: connectedAddressRaw } = useAppKitAccount()
-  const connectedAddress = useMemo(
-    () => connectedAddressRaw && isAddress(connectedAddressRaw) ? getAddress(connectedAddressRaw) as Address : null,
-    [connectedAddressRaw],
-  )
+  const { address: appKitAddressRaw } = useAppKitAccount({ namespace: 'eip155' })
+  const { walletProvider } = useAppKitProvider<RpcWalletProvider>('eip155')
+  const { chainId: appKitChainId } = useAppKitNetworkCore()
   const { data: walletClient } = useWalletClient()
   const publicClient = usePublicClient()
   const { runWithSignaturePrompt } = useSignaturePromptRunner()
+  const user = useUser()
+  const connectedWalletAddress = useMemo(
+    () => resolveProposerWhitelistAddress(appKitAddressRaw, user?.address, walletClient?.account?.address),
+    [appKitAddressRaw, user?.address, walletClient?.account?.address],
+  )
+  const knownCreatorAddress = useMemo(
+    () => resolveProposerWhitelistAddress(appKitAddressRaw, user?.address, walletClient?.account?.address),
+    [appKitAddressRaw, user?.address, walletClient?.account?.address],
+  )
+  const appKitResolvedChainId = useMemo(
+    () => resolveChainId(appKitChainId),
+    [appKitChainId],
+  )
   const [creators, setCreators] = useState<ProposerWhitelistCreatorOption[]>([])
   const [signers, setSigners] = useState<SignerOption[]>([])
   const [selectedCreator, setSelectedCreator] = useState<Address | null>(null)
@@ -194,7 +280,7 @@ export default function AdminProposersDialog({
         creators,
         signers,
         initialCreatorAddress,
-        connectedAddress,
+        connectedAddress: knownCreatorAddress,
         connectedLabel: t('EOA wallet'),
       })
     }
@@ -202,15 +288,28 @@ export default function AdminProposersDialog({
     return mergeCreatorOptions({
       creators,
       signers,
-      connectedAddress,
+      connectedAddress: knownCreatorAddress,
       connectedLabel: t('EOA wallet'),
     })
-  }, [connectedAddress, creators, initialCreatorAddress, lockCreatorSelection, signers, t])
+  }, [creators, initialCreatorAddress, knownCreatorAddress, lockCreatorSelection, signers, t])
   const selectedOption = creatorOptions.find(item => selectedCreator && item.address.toLowerCase() === selectedCreator.toLowerCase()) ?? null
+  const walletClientMatchesSelectedCreator = Boolean(
+    selectedCreator
+    && walletClient
+    && isSameAddress(walletClient.account?.address, selectedCreator),
+  )
+  const hasConnectedWalletTransport = Boolean(
+    isRpcWalletProvider(walletProvider)
+    || walletClientMatchesSelectedCreator,
+  )
+  const connectedWalletTransportChainId = walletClientMatchesSelectedCreator
+    ? walletClient?.chain?.id ?? appKitResolvedChainId
+    : appKitResolvedChainId
   const canUseConnectedWallet = Boolean(
     selectedCreator
-    && connectedAddress
-    && selectedCreator.toLowerCase() === connectedAddress.toLowerCase(),
+    && connectedWalletAddress
+    && isSameAddress(selectedCreator, connectedWalletAddress)
+    && hasConnectedWalletTransport,
   )
   const canUseServerSigner = Boolean(status?.hasServerSigner || selectedOption?.hasServerSigner)
   const isSwitchingCreator = Boolean(
@@ -295,13 +394,13 @@ export default function AdminProposersDialog({
       const availableCreators = mergeCreatorOptions({
         creators: nextPayload.creators,
         signers: nextSigners,
-        connectedAddress,
+        connectedAddress: knownCreatorAddress,
         connectedLabel: t('EOA wallet'),
       })
       const preferred = getPreferredCreator({
         initialCreatorAddress,
         selectedCreator: creator,
-        connectedAddress,
+        connectedAddress: knownCreatorAddress,
         creators: availableCreators,
       })
       setSelectedCreator(preferred)
@@ -314,18 +413,18 @@ export default function AdminProposersDialog({
     finally {
       setIsLoading(false)
     }
-  }, [connectedAddress, initialCreatorAddress, onStatusChange, signers, t])
+  }, [initialCreatorAddress, knownCreatorAddress, onStatusChange, signers, t])
 
   const bootstrapDialog = useEffectEvent(async () => {
     const nextSigners = await loadSigners()
     const preferred = getPreferredCreator({
       initialCreatorAddress,
       selectedCreator: null,
-      connectedAddress,
+      connectedAddress: knownCreatorAddress,
       creators: mergeCreatorOptions({
         creators: [],
         signers: nextSigners,
-        connectedAddress,
+        connectedAddress: knownCreatorAddress,
         connectedLabel: t('EOA wallet'),
       }),
     })
@@ -368,6 +467,30 @@ export default function AdminProposersDialog({
     return payload.txHashes
   }
 
+  async function runServerDeployment(proposers: Address[]) {
+    if (!selectedCreator) {
+      throw new Error(t('Select a creator wallet first.'))
+    }
+
+    const response = await fetch('/admin/api/proposer-whitelists', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'deploy',
+        creator: selectedCreator,
+        proposers,
+      }),
+    })
+    const payload = await response.json().catch(() => null) as unknown
+    const apiError = readApiError(payload)
+    if (!response.ok || apiError || !isDeploymentResponse(payload)) {
+      throw new Error(apiError || t('Could not update proposer whitelist ({status})', { status: String(response.status) }))
+    }
+    return getAddress(payload.whitelistAddress) as Address
+  }
+
   async function waitForWalletTx(hash: Hash) {
     const client = publicClient
     if (!client) {
@@ -380,52 +503,172 @@ export default function AdminProposersDialog({
     return receipt
   }
 
-  function getConnectedWalletClient() {
+  function getConnectedWalletConnection() {
     if (!selectedCreator) {
       throw new Error(t('Select a creator wallet first.'))
     }
-    if (!canUseConnectedWallet || !walletClient) {
+    if (!canUseConnectedWallet) {
       throw new Error(t('Use the selected creator EOA in your wallet to sign this action.'))
     }
-    if (walletClient.chain?.id && walletClient.chain.id !== DEFAULT_CHAIN_ID) {
+    if (connectedWalletTransportChainId && connectedWalletTransportChainId !== DEFAULT_CHAIN_ID) {
       throw new Error(t('Switch wallet to {chain} before updating proposer whitelist.', { chain: defaultViemNetwork.name }))
     }
-    return walletClient
+    const rpcProvider = isRpcWalletProvider(walletProvider)
+      ? walletProvider
+      : walletClientMatchesSelectedCreator && isRpcWalletProvider(walletClient)
+        ? walletClient
+        : null
+    const walletClientMatchesCreator = walletClientMatchesSelectedCreator
+    if (!walletClientMatchesCreator && !rpcProvider) {
+      throw new Error(t('Wallet connection is not ready. Please try again.'))
+    }
+
+    return {
+      rpcProvider,
+      walletClient,
+      walletClientMatchesCreator,
+      chainId: connectedWalletTransportChainId ?? DEFAULT_CHAIN_ID,
+    }
+  }
+
+  async function sendWalletTransaction(input: {
+    title: string
+    description: string
+    account: Address
+    data: Hex
+    to?: Address
+    value?: bigint
+  }) {
+    const connection = getConnectedWalletConnection()
+
+    function sendWithWalletClient(overrides?: {
+      maxFeePerGas?: bigint
+      maxPriorityFeePerGas?: bigint
+    }) {
+      if (!connection.walletClient) {
+        throw new Error(t('Wallet connection is not ready. Please try again.'))
+      }
+
+      return connection.walletClient.sendTransaction({
+        account: input.account,
+        chain: connection.walletClient.chain,
+        to: input.to,
+        data: input.data,
+        value: input.value ?? 0n,
+        ...(overrides ?? {}),
+      })
+    }
+
+    async function sendRpc(overrides?: {
+      maxFeePerGas?: bigint
+      maxPriorityFeePerGas?: bigint
+    }) {
+      if (!connection.rpcProvider) {
+        throw new Error(t('Wallet connection is not ready. Please try again.'))
+      }
+
+      const txRequest = buildRpcWalletTransactionRequest({
+        from: input.account,
+        to: input.to,
+        data: input.data,
+        value: input.value ?? 0n,
+        ...(overrides ?? {}),
+      })
+      const rpcHash = await runWithSignaturePrompt(
+        () => connection.rpcProvider!.request({
+          method: 'eth_sendTransaction',
+          params: [txRequest],
+        }),
+        {
+          title: input.title,
+          description: input.description,
+        },
+      )
+      if (typeof rpcHash !== 'string' || !rpcHash.startsWith('0x')) {
+        throw new Error(t('Wallet provider returned an invalid transaction hash.'))
+      }
+      return rpcHash as Hash
+    }
+
+    async function sendWithRpcFallback(overrides?: {
+      maxFeePerGas?: bigint
+      maxPriorityFeePerGas?: bigint
+    }) {
+      if (!connection.walletClientMatchesCreator) {
+        return await sendRpc(overrides)
+      }
+
+      try {
+        return await runWithSignaturePrompt(() => sendWithWalletClient(overrides), {
+          title: input.title,
+          description: input.description,
+        })
+      }
+      catch (sendError) {
+        const message = sendError instanceof Error ? sendError.message : String(sendError)
+        if (!isBigIntSerializationError(message)) {
+          throw sendError
+        }
+
+        return await sendRpc(overrides)
+      }
+    }
+
+    if (!publicClient) {
+      return sendWithRpcFallback()
+    }
+
+    return sendWithEstimatedFeeRetry({
+      chainId: connection.chainId,
+      client: publicClient,
+      send: sendWithRpcFallback,
+    })
   }
 
   async function runWalletCreate(proposers: Address[]) {
     if (!selectedCreator || !status) {
       throw new Error(t('Select a creator wallet first.'))
     }
-    const client = getConnectedWalletClient()
-    const deployHash = await runWithSignaturePrompt(() => client.deployContract({
-      account: selectedCreator,
-      chain: client.chain,
-      abi: CREATOR_PROPOSER_WHITELIST_ABI,
-      bytecode: CREATOR_PROPOSER_WHITELIST_BYTECODE,
-      args: [selectedCreator, proposers],
-    }), {
-      title: t('Deploy proposer whitelist'),
-      description: t('Transaction 1 of 2: deploy the whitelist contract for this creator.'),
-    })
-    const deployReceipt = await waitForWalletTx(deployHash)
-    const whitelistAddress = deployReceipt?.contractAddress && isAddress(deployReceipt.contractAddress)
-      ? getAddress(deployReceipt.contractAddress) as Address
-      : null
+    let whitelistAddress = status.whitelistAddress
+
     if (!whitelistAddress) {
-      throw new Error(t('Whitelist deployment did not return a contract address.'))
+      if (walletClientMatchesSelectedCreator) {
+        const deployHash = await sendWalletTransaction({
+          title: t('Deploy proposer whitelist'),
+          description: t('Transaction 1 of 2: deploy the whitelist contract for this creator.'),
+          account: selectedCreator,
+          data: encodeDeployData({
+            abi: CREATOR_PROPOSER_WHITELIST_ABI,
+            bytecode: CREATOR_PROPOSER_WHITELIST_BYTECODE,
+            args: [selectedCreator, proposers],
+          }),
+        })
+        const deployReceipt = await waitForWalletTx(deployHash)
+        whitelistAddress = deployReceipt?.contractAddress && isAddress(deployReceipt.contractAddress)
+          ? getAddress(deployReceipt.contractAddress) as Address
+          : null
+        if (!whitelistAddress) {
+          throw new Error(t('Whitelist deployment did not return a contract address.'))
+        }
+      }
+      else if (signers.length > 0) {
+        whitelistAddress = await runServerDeployment(proposers)
+      }
+      else {
+        throw new Error(t('Could not update proposer whitelist.'))
+      }
     }
 
-    const registerHash = await runWithSignaturePrompt(() => client.writeContract({
-      account: selectedCreator,
-      chain: client.chain,
-      address: status.registryAddress,
-      abi: CREATOR_PROPOSER_WHITELIST_REGISTRY_ABI,
-      functionName: 'registerWhitelist',
-      args: [whitelistAddress],
-    }), {
+    const registerHash = await sendWalletTransaction({
       title: t('Register proposer whitelist'),
       description: t('Transaction 2 of 2: register this whitelist in the registry.'),
+      account: selectedCreator,
+      to: status.registryAddress,
+      data: encodeFunctionData({
+        abi: CREATOR_PROPOSER_WHITELIST_REGISTRY_ABI,
+        functionName: 'registerWhitelist',
+        args: [whitelistAddress],
+      }),
     })
     await waitForWalletTx(registerHash)
   }
@@ -434,17 +677,16 @@ export default function AdminProposersDialog({
     if (!selectedCreator || !status?.whitelistAddress) {
       throw new Error(t('Creator whitelist is not registered yet.'))
     }
-    const client = getConnectedWalletClient()
-    const hash = await runWithSignaturePrompt(() => client.writeContract({
-      account: selectedCreator,
-      chain: client.chain,
-      address: status.whitelistAddress!,
-      abi: CREATOR_PROPOSER_WHITELIST_ABI,
-      functionName: action === 'add' ? 'addProposers' : 'removeProposers',
-      args: [proposers],
-    }), {
+    const hash = await sendWalletTransaction({
       title: action === 'add' ? t('Add proposers') : t('Remove proposer'),
       description: t('Open your wallet and approve the whitelist update.'),
+      account: selectedCreator,
+      to: status.whitelistAddress,
+      data: encodeFunctionData({
+        abi: CREATOR_PROPOSER_WHITELIST_ABI,
+        functionName: action === 'add' ? 'addProposers' : 'removeProposers',
+        args: [proposers],
+      }),
     })
     await waitForWalletTx(hash)
   }
@@ -455,23 +697,32 @@ export default function AdminProposersDialog({
       return
     }
 
-    let proposers: Address[] = []
+    let requestedProposers: Address[] = []
     try {
-      proposers = normalizeProposerAddressList(rawProposers)
+      requestedProposers = normalizeProposerAddressList(rawProposers)
     }
     catch (error) {
       toast.error(error instanceof Error ? error.message : t('Invalid wallet address.'))
       return
     }
 
-    if (proposers.length === 0 && action !== 'create') {
+    if (requestedProposers.length === 0 && action !== 'create') {
       toast.error(t('Add at least one wallet.'))
+      return
+    }
+
+    const proposers = omitCreatorFromProposerAddressList(selectedCreator, requestedProposers)
+
+    if (proposers.length === 0 && action !== 'create') {
+      setWalletInput('')
+      setAddOpen(false)
+      toast.success(t('Proposer whitelist updated.'))
       return
     }
 
     setIsMutating(true)
     try {
-      if (canUseServerSigner && !canUseConnectedWallet) {
+      if (canUseServerSigner && (action === 'create' || !canUseConnectedWallet)) {
         await runServerMutation(action, proposers)
       }
       else if (action === 'create') {
@@ -508,9 +759,9 @@ export default function AdminProposersDialog({
 
   const proposerRows = status?.proposers ?? []
   const connectedAddressAlreadyListed = Boolean(
-    connectedAddress && proposerRows.some(proposer => proposer.toLowerCase() === connectedAddress.toLowerCase()),
+    knownCreatorAddress && proposerRows.some(proposer => proposer.toLowerCase() === knownCreatorAddress.toLowerCase()),
   )
-  const showAddYourWallet = Boolean((!status?.whitelistAddress || addOpen) && connectedAddress && !connectedAddressAlreadyListed && !walletInput.trim())
+  const showAddYourWallet = Boolean((!status?.whitelistAddress || addOpen) && knownCreatorAddress && !connectedAddressAlreadyListed && !walletInput.trim())
   const actionDisabled = isLoading || isMutating || !selectedCreator || !status || (!canUseConnectedWallet && !canUseServerSigner)
 
   return (
@@ -644,7 +895,7 @@ export default function AdminProposersDialog({
                     <button
                       type="button"
                       className="w-fit text-xs font-medium text-primary hover:opacity-80"
-                      onClick={() => setWalletInput(connectedAddress ?? '')}
+                      onClick={() => setWalletInput(knownCreatorAddress ?? '')}
                     >
                       {t('add my own wallet')}
                     </button>
